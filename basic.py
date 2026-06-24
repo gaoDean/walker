@@ -1,3 +1,4 @@
+import os
 import random
 import matplotlib.pyplot as plt
 import numpy as np
@@ -5,6 +6,7 @@ import pandas as pd
 import seaborn as sns
 import torch
 import torch.nn as nn
+from torch import optim
 from torch.distributions.normal import Normal
 
 import gymnasium as gym
@@ -13,8 +15,16 @@ plt.rcParams["figure.figsize"] = (10, 5)
 
 class PolicyNetwork(nn.Module):
 
-    def __init__(self, obs_space_dims: int, action_space_dims: int):
+    def __init__(
+        self,
+        obs_space_dims: int,
+        action_space_dims: int,
+        device = torch.device,
+        n_envs: int,
+    ):
         super().__init__()
+        self.device = device
+        self.n_envs = n_envs
 
         hidden_space1 = 16
         hidden_space2 = 32
@@ -28,10 +38,10 @@ class PolicyNetwork(nn.Module):
 
         self.policy_mean_net = nn.Sequential(
             nn.Linear(hidden_space2, action_space_dims)
-        )
+        ).to(self.device)
         self.policy_stddev_net = nn.Sequential(
             nn.Linear(hidden_space2, action_space_dims)
-        )
+        ).to(self.device)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         shared_features = self.shared_net(x.float())
@@ -94,12 +104,12 @@ class REINFORCE:
         self.rewards = []
 
 
-env = gym.make("InvertedDoublePendulum-v5", render_mode="human")
+env = gym.make("InvertedDoublePendulum-v5", num_envs=3, render_mode="human")
 wrapped_env = gym.wrappers.RecordEpisodeStatistics(env, 50)
 wrapped_env.action_space = gym.spaces.Box(-3.0, 3.0, (1,), float)
 wrapped_env.observation_space = gym.spaces.Box(float("-inf"), float("inf"), (4,), float)
 
-total_num_episodes = int(5e4)
+total_num_episodes = int(5e5)
 obs_space_dims = env.observation_space.shape[0]
 action_space_dims = env.action_space.shape[0]
 reward_over_seeds = []
