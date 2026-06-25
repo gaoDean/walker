@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch import optim
 from torch.distributions.normal import Normal
+from tqdm import tqdm
 
 import gymnasium as gym
 
@@ -68,8 +69,11 @@ class REINFORCE:
         self.gamma = 0.99 # discount
         self.eps = 1e-6 # small number? probably prevent div 0
 
+
+        # all on the cpu
         self.probs = [] # probability of any given action
         self.rewards = [] # corresponding rewards
+        self.masks = [] # corresponding mask for each of the envs, 0 means episode terminated
 
         self.device = device
         self.net = PolicyNetwork(obs_space_dims, action_space_dims, device, n_envs)
@@ -86,7 +90,7 @@ class REINFORCE:
 
         distribution = Normal(action_means + self.eps, action_stddevs + self.eps)
         action = distribution.sample()
-        prob = distribution.log_prob(action)
+        prob = distribution.log_prob(action).cpu()
 
         # action = action.numpy()
 
@@ -98,13 +102,19 @@ class REINFORCE:
         running_g = 0 # return
         gs = []
 
-        for R in self.rewards[::-1]:
-            running_g = R + self.gamma * running_g
+        # start from the last (most recent) reward and go backwards
+        for i in range(0, -1, -1):
+            reward = self.rewards[i]
+            mask = self.masks[i]
+            running_g = reward * mask + self.gamma * running_g
             gs.insert(0, running_g)
 
-        deltas = torch.Tensor(gs)
+        print(gs)
+        deltas = gs
 
         log_probs = torch.stack(self.probs).squeeze()
+
+        print(log_probs, deltas)
 
         loss = -torch.sum(log_probs * deltas)
 
@@ -136,7 +146,6 @@ wrapped_env.observation_space = gym.spaces.Box(float("-inf"), float("inf"), (4,)
 
 obs_space_dims = env.single_observation_space.shape[0]
 action_space_dims = env.single_action_space.shape[0]
-reward_over_seeds = []
 
 torch.manual_seed(seed)
 random.seed(seed)
@@ -148,10 +157,35 @@ device = torch.device("mps")
 agent = REINFORCE(obs_space_dims, action_space_dims, device, n_envs)
 
 # BEGIN TEST
-actions = agent.sample_action(obs)
-obs, reward, terminated, truncated, _ = wrapped_env.step(actions.cpu().numpy())
-print(obs)
+
 env.close()
+
+for sample_phase in tqdm(range(n_updates)):
+
+    for step in range(steps_per_update):
+        # actions is a batched array
+        actions = agent.sample_action(obs)
+
+        (
+            obs,
+            reward,
+            terminated,
+            truncated,
+            _
+        ) = wrapped_env.step(actions.cpu().numpy())
+
+        agent.rewards.append(torch.Tensor(reward))
+
+        agent.masks.append(torch.tensor([not term for term in terminated]))
+
+    agent.update()
+
+    if sample_phase % 100 == 0:
+        avg_reward = int(np.mean(wrapped_env.return_queue))
+        print("Episode:", episode, "Average Reward:", avg_reward)
+
+
+
 
 # for sample_phase in tqdm(range(n_updates))
 #
