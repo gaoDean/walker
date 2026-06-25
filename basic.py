@@ -1,5 +1,6 @@
 import os
 import random
+import time
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -76,6 +77,7 @@ class REINFORCE:
         self.masks = [] # corresponding mask for each of the envs, 0 means episode terminated
 
         self.device = device
+        self.n_envs = n_envs
         self.net = PolicyNetwork(obs_space_dims, action_space_dims, device, n_envs)
         self.optimizer = torch.optim.AdamW(self.net.parameters(), lr = self.lr)
 
@@ -100,21 +102,20 @@ class REINFORCE:
 
     def update(self):
         running_g = 0 # return
-        gs = []
+        gs = torch.zeros(len(self.rewards), self.n_envs)
 
         # start from the last (most recent) reward and go backwards
-        for i in range(0, -1, -1):
+        for i in range(len(self.rewards) - 1, -1, -1):
             reward = self.rewards[i]
             mask = self.masks[i]
-            running_g = reward * mask + self.gamma * running_g
-            gs.insert(0, running_g)
+            running_g = np.multiply(reward, mask) + self.gamma * running_g
+            gs[i] = running_g
 
-        print(gs)
         deltas = gs
 
         log_probs = torch.stack(self.probs).squeeze()
 
-        print(log_probs, deltas)
+        # print(log_probs, deltas)
 
         loss = -torch.sum(log_probs * deltas)
 
@@ -124,94 +125,116 @@ class REINFORCE:
 
         self.probs = []
         self.rewards = []
+        self.masks = []
+
+    def save(self):
+        torch.save(self, "save.ckpt")
 
 
-n_envs = 3
-n_updates = int(5e3)
-steps_per_update = 128
-seed = 42
+if __name__ == "__main__":
+    n_envs = 8
+    n_updates = int(1e6)
+    steps_per_update = 16
+    seed = 43
 
-env = gym.make_vec(
-    "InvertedDoublePendulum-v5",
-    num_envs=n_envs,
-    render_mode="human"
-)
-wrapped_env = gym.wrappers.vector.RecordEpisodeStatistics(
-    env,
-    buffer_length=n_envs * n_updates
-)
+    env = gym.make_vec(
+        "InvertedDoublePendulum-v5",
+        num_envs=n_envs,
+        # render_mode="human",
+        render_mode=None,
+        vectorization_mode="async"
+    )
+    wrapped_env = gym.wrappers.vector.RecordEpisodeStatistics(
+        env,
+        buffer_length=n_envs * n_updates
+    )
 
-wrapped_env.action_space = gym.spaces.Box(-3.0, 3.0, (1,), float)
-wrapped_env.observation_space = gym.spaces.Box(float("-inf"), float("inf"), (4,), float)
+    wrapped_env.action_space = gym.spaces.Box(-3.0, 3.0, (1,), float)
+    wrapped_env.observation_space = gym.spaces.Box(float("-inf"), float("inf"), (4,), float)
 
-obs_space_dims = env.single_observation_space.shape[0]
-action_space_dims = env.single_action_space.shape[0]
+    obs_space_dims = env.single_observation_space.shape[0]
+    action_space_dims = env.single_action_space.shape[0]
 
-torch.manual_seed(seed)
-random.seed(seed)
-np.random.seed(seed)
-obs, info = wrapped_env.reset()
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    obs, info = wrapped_env.reset()
 
-device = torch.device("mps")
+    device = torch.device("cpu")
 
-agent = REINFORCE(obs_space_dims, action_space_dims, device, n_envs)
+    agent = REINFORCE(obs_space_dims, action_space_dims, device, n_envs)
 
-# BEGIN TEST
+    for sample_phase in tqdm(range(n_updates)):
 
-env.close()
+        avg_steps = []
+        finished_episode_steps_count = 0
+        finished_episodes = 0
+        for step in range(steps_per_update):
+            # actions is a batched array
+            actions = agent.sample_action(obs)
 
-for sample_phase in tqdm(range(n_updates)):
+            (
+                obs,
+                reward,
+                terminated,
+                truncated,
+                info
+            ) = wrapped_env.step(actions.cpu().numpy())
 
-    for step in range(steps_per_update):
-        # actions is a batched array
-        actions = agent.sample_action(obs)
+            if "episode" in info:
+                for ep in info["episode"]["l"]:
+                    if ep != 0:
+                        finished_episode_steps_count += ep
+                        finished_episodes += 1
 
-        (
-            obs,
-            reward,
-            terminated,
-            truncated,
-            _
-        ) = wrapped_env.step(actions.cpu().numpy())
+            agent.rewards.append(torch.Tensor(reward))
 
-        agent.rewards.append(torch.Tensor(reward))
+            agent.masks.append([not term for term in terminated])
 
-        agent.masks.append(torch.tensor([not term for term in terminated]))
+        # adapt the steps per update to the average steps per episode
+        # to optimise when we update the policy weights (one update per episode)
+        # steps_per_update = wrapped_env.
+        if finished_episodes > 0:
+            avg_steps = round(finished_episode_steps_count / finished_episodes)
+            steps_per_update = max(avg_steps, 1)
 
-    agent.update()
+        agent.update()
 
-    if sample_phase % 100 == 0:
-        avg_reward = int(np.mean(wrapped_env.return_queue))
-        print("Episode:", episode, "Average Reward:", avg_reward)
+        if sample_phase % 1000 == 0:
+            avg_reward = int(np.mean(wrapped_env.return_queue))
+            print("sample:", sample_phase, "Average Reward:", avg_reward, "average steps:", avg_steps)
+
+    env.close()
+
+    agent.save()
 
 
 
-
-# for sample_phase in tqdm(range(n_updates))
-#
-#     done = False
-#     while not done:
-#         action = agent.sample_action(obs)
-#
-#         obs, reward, terminated, truncated, _ = wrapped_env.step(action.cpu().numpy())
-#         agent.rewards.append(reward)
-#
-#         done = terminated or truncated
-#
-#     reward_over_episodes.append(wrapped_env.return_queue[-1])
-#     agent.update()
-#
-#     if episode % 1000 == 0:
-#         avg_reward = int(np.mean(wrapped_env.return_queue))
-#         print("Episode:", episode, "Average Reward:", avg_reward)
-#
-# reward_over_seeds.append(reward_over_episodes)
-#
-# df1 = pd.DataFrame(rewards_over_seeds).melt()
-# df1.rename(columns={"variable": "eposids", "value": "reward"}, inplace=True)
-# sns.set(style="darkgrid", context="talk", palette="rainbow")
-# sns.lineplot(x="eposids", y="reward", data=df1).set(
-#     title="reinforce pendulem"
-# )
-#
-# plt.show()
+    # for sample_phase in tqdm(range(n_updates))
+    #
+    #     done = False
+    #     while not done:
+    #         action = agent.sample_action(obs)
+    #
+    #         obs, reward, terminated, truncated, _ = wrapped_env.step(action.cpu().numpy())
+    #         agent.rewards.append(reward)
+    #
+    #         done = terminated or truncated
+    #
+    #     reward_over_episodes.append(wrapped_env.return_queue[-1])
+    #     agent.update()
+    #
+    #     if episode % 1000 == 0:
+    #         avg_reward = int(np.mean(wrapped_env.return_queue))
+    #         print("Episode:", episode, "Average Reward:", avg_reward)
+    #
+    # reward_over_seeds.append(reward_over_episodes)
+    #
+    # df1 = pd.DataFrame(rewards_over_seeds).melt()
+    # df1.rename(columns={"variable": "eposids", "value": "reward"}, inplace=True)
+    # sns.set(style="darkgrid", context="talk", palette="rainbow")
+    # sns.lineplot(x="eposids", y="reward", data=df1).set(
+    #     title="reinforce pendulem"
+    # )
+    #
+    # plt.show()
