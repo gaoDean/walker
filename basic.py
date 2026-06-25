@@ -19,7 +19,7 @@ class PolicyNetwork(nn.Module):
         self,
         obs_space_dims: int,
         action_space_dims: int,
-        device = torch.device,
+        device,
         n_envs: int,
     ):
         super().__init__()
@@ -34,7 +34,7 @@ class PolicyNetwork(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_space1, hidden_space2),
             nn.Tanh(),
-        )
+        ).to(self.device)
 
         self.policy_mean_net = nn.Sequential(
             nn.Linear(hidden_space2, action_space_dims)
@@ -43,8 +43,10 @@ class PolicyNetwork(nn.Module):
             nn.Linear(hidden_space2, action_space_dims)
         ).to(self.device)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        shared_features = self.shared_net(x.float())
+    def forward(self, x: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        x = torch.Tensor(x).to(self.device)
+
+        shared_features = self.shared_net(x)
 
         action_means = self.policy_mean_net(shared_features)
         action_stddevs = torch.log(
@@ -55,7 +57,13 @@ class PolicyNetwork(nn.Module):
 
 class REINFORCE:
 
-    def __init__(self, obs_space_dims: int, action_space_dims: int):
+    def __init__(
+        self,
+        obs_space_dims: int,
+        action_space_dims: int,
+        device,
+        n_envs: int,
+    ):
         self.lr = 1e-4
         self.gamma = 0.99 # discount
         self.eps = 1e-6 # small number? probably prevent div 0
@@ -63,20 +71,24 @@ class REINFORCE:
         self.probs = [] # probability of any given action
         self.rewards = [] # corresponding rewards
 
-        self.net = PolicyNetwork(obs_space_dims, action_space_dims)
+        self.device = device
+        self.net = PolicyNetwork(obs_space_dims, action_space_dims, device, n_envs)
         self.optimizer = torch.optim.AdamW(self.net.parameters(), lr = self.lr)
 
-    def sample_action(self, state: np.ndarray) -> float:
-        """ returns action output when inputting state into policy"""
+    def sample_action(self, x: np.ndarray) -> torch.Tensor():
+        """
+        returns batched array of action output when inputting state into policy
 
-        state = torch.tensor(np.array([state]))
-        action_means, action_stddevs = self.net(state)
+        state is a batched array
+        """
 
-        distribution = Normal(action_means[0] + self.eps, action_stddevs[0] + self.eps)
+        action_means, action_stddevs = self.net(x)
+
+        distribution = Normal(action_means + self.eps, action_stddevs + self.eps)
         action = distribution.sample()
         prob = distribution.log_prob(action)
 
-        action = action.numpy()
+        # action = action.numpy()
 
         self.probs.append(prob)
 
@@ -90,7 +102,7 @@ class REINFORCE:
             running_g = R + self.gamma * running_g
             gs.insert(0, running_g)
 
-        deltas = torch.tensor(gs)
+        deltas = torch.Tensor(gs)
 
         log_probs = torch.stack(self.probs).squeeze()
 
@@ -104,50 +116,68 @@ class REINFORCE:
         self.rewards = []
 
 
-env = gym.make("InvertedDoublePendulum-v5", num_envs=3, render_mode="human")
-wrapped_env = gym.wrappers.RecordEpisodeStatistics(env, 50)
+n_envs = 3
+n_updates = int(5e3)
+steps_per_update = 128
+seed = 42
+
+env = gym.make_vec(
+    "InvertedDoublePendulum-v5",
+    num_envs=n_envs,
+    render_mode="human"
+)
+wrapped_env = gym.wrappers.vector.RecordEpisodeStatistics(
+    env,
+    buffer_length=n_envs * n_updates
+)
+
 wrapped_env.action_space = gym.spaces.Box(-3.0, 3.0, (1,), float)
 wrapped_env.observation_space = gym.spaces.Box(float("-inf"), float("inf"), (4,), float)
 
-total_num_episodes = int(5e5)
-obs_space_dims = env.observation_space.shape[0]
-action_space_dims = env.action_space.shape[0]
+obs_space_dims = env.single_observation_space.shape[0]
+action_space_dims = env.single_action_space.shape[0]
 reward_over_seeds = []
 
-for seed in [1]:
-    torch.manual_seed(seed)
-    random.seed(seed)
-    np.random.seed(seed)
+torch.manual_seed(seed)
+random.seed(seed)
+np.random.seed(seed)
+obs, info = wrapped_env.reset()
 
-    agent = REINFORCE(obs_space_dims, action_space_dims)
-    reward_over_episodes = []
+device = torch.device("mps")
 
-    for episode in range(total_num_episodes):
-        obs, info = wrapped_env.reset()
+agent = REINFORCE(obs_space_dims, action_space_dims, device, n_envs)
 
-        done = False
-        while not done:
-            action = agent.sample_action(obs)
+# BEGIN TEST
+actions = agent.sample_action(obs)
+obs, reward, terminated, truncated, _ = wrapped_env.step(actions.cpu().numpy())
+print(obs)
+env.close()
 
-            obs, reward, terminated, truncated, _ = wrapped_env.step(action)
-            agent.rewards.append(reward)
-
-            done = terminated or truncated
-
-        reward_over_episodes.append(wrapped_env.return_queue[-1])
-        agent.update()
-
-        if episode % 1000 == 0:
-            avg_reward = int(np.mean(wrapped_env.return_queue))
-            print("Episode:", episode, "Average Reward:", avg_reward)
-
-    reward_over_seeds.append(reward_over_episodes)
-
-df1 = pd.DataFrame(rewards_over_seeds).melt()
-df1.rename(columns={"variable": "eposids", "value": "reward"}, inplace=True)
-sns.set(style="darkgrid", context="talk", palette="rainbow")
-sns.lineplot(x="eposids", y="reward", data=df1).set(
-    title="reinforce pendulem"
-)
-
-plt.show()
+# for sample_phase in tqdm(range(n_updates))
+#
+#     done = False
+#     while not done:
+#         action = agent.sample_action(obs)
+#
+#         obs, reward, terminated, truncated, _ = wrapped_env.step(action.cpu().numpy())
+#         agent.rewards.append(reward)
+#
+#         done = terminated or truncated
+#
+#     reward_over_episodes.append(wrapped_env.return_queue[-1])
+#     agent.update()
+#
+#     if episode % 1000 == 0:
+#         avg_reward = int(np.mean(wrapped_env.return_queue))
+#         print("Episode:", episode, "Average Reward:", avg_reward)
+#
+# reward_over_seeds.append(reward_over_episodes)
+#
+# df1 = pd.DataFrame(rewards_over_seeds).melt()
+# df1.rename(columns={"variable": "eposids", "value": "reward"}, inplace=True)
+# sns.set(style="darkgrid", context="talk", palette="rainbow")
+# sns.lineplot(x="eposids", y="reward", data=df1).set(
+#     title="reinforce pendulem"
+# )
+#
+# plt.show()
