@@ -133,7 +133,7 @@ class REINFORCE:
 
 if __name__ == "__main__":
     n_envs = 8
-    n_updates = int(1e6)
+    n_updates = int(1e5)
     steps_per_update = 16
     seed = 43
 
